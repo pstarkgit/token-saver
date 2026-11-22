@@ -1,0 +1,86 @@
+name: Weekly release
+
+on:
+  schedule:
+    - cron: '17 10 * * 1'
+      timezone: 'America/Denver'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Publish a patch release if main moved
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          head = os.environ["GITHUB_SHA"]
+          stable = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+
+          def gh(*args):
+              return subprocess.check_output(["gh", *args], text=True).strip()
+
+          def published_versions():
+              pages = json.loads(gh("api", "--paginate", "--slurp",
+                                    f"repos/{repo}/releases?per_page=100"))
+              for page in pages:
+                  for release in page:
+                      if release["draft"] or release["prerelease"]:
+                          continue
+                      tag = release["tag_name"]
+                      version = stable.fullmatch(tag)
+                      if version:
+                          yield tuple(map(int, version.groups())), tag
+
+          def tag_commit(tag):
+              return gh("api", f"repos/{repo}/commits/tags/{tag}", "--jq", ".sha")
+
+          def release():
+              latest = max(published_versions(), default=None)
+              tag = "v0.1.0"
+              if latest:
+                  (major, minor, patch), previous = latest
+                  if tag_commit(previous) == head:
+                      print(f"No release: {previous} already points to this commit.")
+                      return
+                  tag = f"v{major}.{minor}.{patch + 1}"
+
+              main = gh("api", f"repos/{repo}/git/ref/heads/main", "--jq", ".object.sha")
+              if main != head:
+                  print("No release: main changed after this workflow was queued.")
+                  return
+
+              # Never let gh reuse an existing tag on a different commit.
+              tag_pages = json.loads(gh("api", "--paginate", "--slurp",
+                                        f"repos/{repo}/tags?per_page=100"))
+              exists = any(item["name"] == tag for page in tag_pages for item in page)
+              if exists and tag_commit(tag) != head:
+                  raise SystemExit(f"Refusing to publish {tag}: its existing tag points elsewhere.")
+
+              args = ["release", "create", tag, "--repo", repo, "--target", head,
+                      "--title", tag, "--generate-notes"]
+              if exists:
+                  args.append("--verify-tag")
+              print(gh(*args))
+              if tag_commit(tag) != head:
+                  raise SystemExit(f"Published tag {tag} did not resolve to the expected commit.")
+
+          if os.environ["GITHUB_REF"] == "refs/heads/main":
+              release()
+          PY
