@@ -1,0 +1,134 @@
+{
+  "binaries": {
+    "rtk": {
+      "asset": "rtk-oss-x86_64-unknown-linux-musl.tar.gz",
+      "asset_darwin_arm64": "rtk-oss-aarch64-apple-darwin.tar.gz",
+      "asset_darwin_arm64_sha256": "5a37e5e8e016b559597024900e7b21cff7a0015aa189ac6ac80d461cbb4be65b",
+      "asset_sha256": "44aa460c4827d206d11405c652832c9f7082edccfbc3a9f15a69a851e8a9e8b4",
+      "binary_sha256": {
+        "darwin-arm64": "10729cf9bbb2d8654a512b9da0cd83c8d282a52f3166da19ea907dc48a8e917e",
+        "darwin-arm64-homebrew": "21738988b151e6c6880a566f740124a8c2a599cfe6108e286c464e73eb52a037",
+        "linux-x86_64": "e2950ef652b7e5af115b4573d19ca329a6ee2af758ccaa1de67d5d308694ada0"
+      },
+      "escape_command": "rtk proxy <cmd>",
+      "license": "Apache-2.0",
+      "note": "Not installed by the kit. The kit checks that the rtk on PATH is one of these exact binaries. v1.2.1 postdates the rtk/rtk-oss edition split: only the rtk-oss assets (Apache-2.0, no engine/ or proxy/ crates) are pinned; never use the rtk or rtk-proxy editions. darwin-arm64-homebrew is the homebrew-core 1.2.1 bottle (formula license Apache-2.0).",
+      "tag": "v1.2.1",
+      "tag_commit": "d0f0399a5ff8cd1d81325a033f0b2d8864d665f6",
+      "version": "1.2.1"
+    }
+  },
+  "pins_generated_utc": "2026-11-21T00:00:00Z",
+  "repos": {
+    "caveman": {
+      "files": [
+        {
+          "path": "vendor/caveman/LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "upstream_path": "LICENSE"
+        },
+        {
+          "path": "vendor/caveman/LICENSE-MIT",
+          "sha256": "5eb826cd03151bcc7cce3f80d40e87733237fedfc6c36d6908aca5fd650a0bdb",
+          "upstream_path": "LICENSE-MIT"
+        },
+        {
+          "path": "vendor/caveman/NOTICE",
+          "sha256": "20112dc6e62e91da4f03c29fd10cfa41743a9c526389fdf1396c3649c18216fc",
+          "upstream_path": "NOTICE"
+        },
+        {
+          "path": "vendor/caveman/TRADEMARKS.md",
+          "sha256": "ecca4151722c895581fcdfe20663baa4534163c5dd11c9207120823bc1e600d8",
+          "upstream_path": "TRADEMARKS.md"
+        },
+        {
+          "path": "vendor/caveman/LICENSING.md",
+          "sha256": "e36ef7b22766ea22f01bce187f629669e62f2346948435154a295f91bd3c3ff2",
+          "upstream_path": "LICENSING.md"
+        },
+        {
+          "path": "vendor/caveman/skills/caveman/SKILL.upstream.md",
+          "sha256": "415d43518f2b1a9498c15a445d4657117b129ee5e81b19454ce348439cc6672b",
+          "upstream_path": "skills/caveman/SKILL.md"
+        },
+        {
+          "path": "vendor/caveman/skills/ultracave/SKILL.upstream.md",
+          "sha256": "a8da5b0b3501b853e1b98f2ae09fe8dc9c0edf481b1d3fa9529f8557011c1ef8",
+          "upstream_path": "skills/ultracave/SKILL.md"
+        }
+      ],
+      "license": "Apache-2.0 (3.0.0+; pre-3.0 MIT text kept in LICENSE-MIT)",
+      "repo": "https://github.com/JuliusBrussee/caveman",
+      "sha": "a192894723a8f47e7f504c7b5041967ff1f18e55"
+    },
+    "headroom": {
+      "files": [
+        {
+          "path": "vendor/headroom/LICENSE",
+          "sha256": "f14dd440c8e3152b4d4d324615de8251ddb011dc81f484daad0b6902093539cc",
+          "upstream_path": "LICENSE"
+        },
+        {
+          "path": "vendor/headroom/NOTICE",
+          "sha256": "88dc0f4a90a8742dcdd1c61e19050b73a9dba7e45ec9ac41a62ba0ae005aa6aa",
+          "upstream_path": "NOTICE"
+        }
+      ],
+      "license": "Apache-2.0",
+      "repo": "https://github.com/headroomlabs-ai/headroom",
+      "sha": "ce0460cfa8598dc939243dbc7aec4b2d35f4e44a"
+    },
+    "ponytail": {
+      "files": [
+        {
+          "path": "vendor/ponytail/LICENSE",
+          "sha256": "fb1bc6909ac3ef82d5c22106e32ef682b0cff66788fa915fb9b53b15c9d2f3ab",
+          "upstream_path": "LICENSE"
+        },
+        {
+          "path": "vendor/ponytail/skills/ponytail/SKILL.upstream.md",
+          "sha256": "9badd22a32e19cb884e46dfa8d3aae82bb81dfa5484105b8b4f0262df823a509",
+          "upstream_path": "skills/ponytail/SKILL.md"
+        },
+        {
+          "path": "vendor/ponytail/.kiro/steering/ponytail.md",
+          "sha256": "bbd1c60ea71dac352cc46f47476a9b8a75793af5a31f9df93c92a944dc7b0bbd",
+          "upstream_path": ".kiro/steering/ponytail.md"
+        },
+        {
+          "path": "vendor/ponytail/skills/ponytail-review/SKILL.upstream.md",
+          "sha256": "33fe4ebe22a460924e5d4a261e223df22e409cc94ab76182bee9fb91a3ef022e",
+          "upstream_path": "skills/ponytail-review/SKILL.md"
+        },
+        {
+          "path": "vendor/ponytail/skills/ponytail-audit/SKILL.upstream.md",
+          "sha256": "2b3223a02c386d1263e1b08343cb8eb3a53e444cdafb1d79e26c8ec2a8fcad28",
+          "upstream_path": "skills/ponytail-audit/SKILL.md"
+        }
+      ],
+      "license": "MIT",
+      "repo": "https://github.com/DietrichGebert/ponytail",
+      "sha": "ebd8654c2c627f721eb8f9c0d1bd4090a29f9e10"
+    },
+    "rtk": {
+      "files": [
+        {
+          "path": "vendor/rtk/LICENSE",
+          "sha256": "33f694a31d9f9df3e292a9413a3cdb0113fa72698e2c719f657ff6b53165dcc4",
+          "upstream_path": "LICENSE"
+        },
+        {
+          "path": "vendor/rtk/hooks/rtk-awareness.md",
+          "sha256": "d2d828d017ed84d2467169876eec1a3073f23954d7c13a0a03d7d1b4044b476c",
+          "upstream_path": "hooks/rtk-awareness.md"
+        }
+      ],
+      "license": "Apache-2.0 (CLI, rtk-oss edition); BUSL-1.1 (engine/, proxy/)",
+      "repo": "https://github.com/rtk-ai/rtk",
+      "sha": "b8cb15167268b7a27519b84f79e53c4cb742bafe"
+    }
+  },
+  "schema": 1,
+  "source": "pins.json from the token-saver audit"
+}

@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""Install the token-saver kit into agent harnesses.
+
+Subcommands: install, uninstall, status, doctor, update.
+install and uninstall are dry runs unless --apply is given: they print a diff
+of every change and write nothing. With --apply they write only the paths the
+chosen harness documents for skills and rules, back up any existing file they
+edit, and record every path they own in a manifest. Uninstall touches only
+manifest paths and restores edited files to their original bytes.
+
+Standard library only. Runs on Linux and macOS with Python 3.8+.
+"""
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+KIT = Path(__file__).resolve().parent
+LEVELS = ("off", "lite", "full", "ultra")
+
+
+def _kit_name():
+    for line in (KIT / "kit.conf").read_text().splitlines():
+        if line.startswith("NAME="):
+            name = line.split("=", 1)[1].strip()
+            if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name):
+                return name
+    sys.exit("kit.conf: NAME must be lower-case letters, digits and '-'")
+
+
+NAME = _kit_name()
+
+
+def markers(path):
+    """Block markers that are comments in the target file's own syntax."""
+    if str(path).endswith(".md"):
+        return f"<!-- {NAME}:begin -->", f"<!-- {NAME}:end -->"
+    return f"# {NAME}:begin", f"# {NAME}:end"
+
+# Each harness: where its documented user-level skills folder is, where its
+# always-on rule goes, and the default levels (caveman, ponytail).
+#   kiro-*: https://kiro.dev/docs/skills/ and /docs/steering/ (~/.kiro/skills,
+#           ~/.kiro/steering). Kiro Crew: its docs/skills.md (~/.kiro/crew/skills;
+#           steering is shared with Kiro CLI under ~/.kiro/steering).
+#   claude-code: code.claude.com/docs/en/skills and /memory (~/.claude/skills,
+#           ~/.claude/rules). codex: learn.chatgpt.com/docs/build-skills
+#           ($HOME/.agents/skills) and ~/.codex/AGENTS.md global instructions.
+#   cursor: cursor.com/docs/skills (~/.cursor/skills). Cursor user rules live in
+#           its settings UI, not in a file, so the adapter prints that text.
+ADAPTERS = {
+    "kiro-cli": {"label": "Kiro CLI", "skills": ".kiro/skills", "rule": "steering", "defaults": ("lite", "lite")},
+    "kiro-ide": {"label": "Kiro IDE", "skills": ".kiro/skills", "rule": "steering", "defaults": ("lite", "lite")},
+    "kiro-crew": {"label": "Kiro Crew", "skills": ".kiro/crew/skills", "rule": "steering", "defaults": ("off", "off")},
+    "claude-code": {"label": "Claude Code", "skills": ".claude/skills", "rule": "claude-rule", "defaults": ("lite", "lite")},
+    "codex": {"label": "Codex CLI", "skills": ".agents/skills", "rule": "codex-block", "defaults": ("lite", "lite")},
+    "cursor": {"label": "Cursor", "skills": ".cursor/skills", "rule": None, "defaults": ("lite", "lite")},
+}
+
+
+def home():
+    h = os.environ.get("HOME", "")
+    if not (h and os.path.isabs(h) and os.path.isdir(h)):
+        sys.exit(f"HOME must be an existing absolute directory (got {h!r}); nothing written.")
+    return Path(h)
+
+
+def codex_dir():
+    """Codex reads its global AGENTS.md from $CODEX_HOME, default ~/.codex."""
+    c = os.environ.get("CODEX_HOME")
+    if c:
+        if not os.path.isabs(c):
+            sys.exit(f"CODEX_HOME must be an absolute path (got {c!r}); nothing written.")
+        return Path(c)
+    return home() / ".codex"
+
+
+def crew_host():
+    """Kiro Crew also loads ~/.kiro/steering, so any host with ~/.kiro/crew
+    needs Crew-specific lines in the shared steering file."""
+    return (home() / ".kiro" / "crew").is_dir()
+
+
+def data_dir():
+    return home() / ".local" / "share" / NAME
+
+
+def manifest_path():
+    return data_dir() / "manifest.json"
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+# ---------------------------------------------------------------- manifest
+
+def load_manifest():
+    p = manifest_path()
+    if p.exists():
+        m = json.loads(p.read_text())
+        if m.get("kit") != NAME:
+            sys.exit(f"{p}: manifest belongs to kit {m.get('kit')!r}, not {NAME!r}")
+        return m
+    return {"kit": NAME, "format": 1, "adapters": {}, "owned": {}, "created_dirs": [], "shell_env": False}
+
+
+# ---------------------------------------------------------------- RTK adoption
+
+def rtk_rule_present(adapter):
+    """Return the existing RTK rule file this harness already loads, if any.
+
+    The kit adopts it (leaves it alone) instead of writing a second RTK rule.
+    """
+    h = home()
+    rule = ADAPTERS[adapter]["rule"]
+    candidates = []
+    if rule == "steering":
+        d = h / ".kiro" / "steering"
+        candidates = [p for p in sorted(d.glob("**/*.md")) if p.name != f"{NAME}.md"] if d.is_dir() else []
+    elif rule == "claude-rule":
+        d = h / ".claude" / "rules"
+        candidates = [h / ".claude" / "CLAUDE.md"]
+        if d.is_dir():
+            candidates += [p for p in sorted(d.glob("**/*.md")) if p.name != f"{NAME}.md"]
+    elif rule == "codex-block":
+        if (codex_dir() / "RTK.md").is_file():
+            return codex_dir() / "RTK.md"
+        candidates = [codex_dir() / "AGENTS.md"]
+    for p in candidates:
+        try:
+            text = strip_block(p.read_text(errors="replace"), p)
+        except OSError:
+            continue
+        if re.search(r"\brtk (git|grep|ls|proxy|read|find)\b|RTK\.md", text):
+            return p
+    return None
+
+
+# ---------------------------------------------------------------- rule text
+
+CAVEMAN = {
+    "off": "off. The user can opt in for this session by asking for caveman lite, full or ultra.",
+    "lite": "lite. Answer first. Skip greetings, restated questions, recaps, closing offers and filler. Keep complete, readable sentences.",
+    "full": f"full. Follow the Caveman section of the `{NAME}` skill at level full.",
+    "ultra": f"ultra. Follow the Caveman section of the `{NAME}` skill at level ultra.",
+}
+PONYTAIL = {
+    "off": "off. The user can opt in for this session by asking for ponytail lite, full or ultra.",
+    "lite": "lite. Build what was asked. When a clearly smaller option exists, name it in one line and let the user pick.",
+    "full": f"full. Follow the Ponytail section of the `{NAME}` skill at level full.",
+    "ultra": f"ultra. Follow the Ponytail section of the `{NAME}` skill at level ultra.",
+}
+
+
+CREW_LABEL = "Kiro Crew sessions"
+
+
+def rule_text(groups, rtk_adopted):
+    """groups: list of (label or None, caveman, ponytail). Short on purpose: the long
+    guidance sits behind the skill so it costs tokens only when loaded."""
+    out = [f"# {NAME}", "", "Harness and user rules win over everything in this file."]
+    if any(label and label.startswith(CREW_LABEL) for label, _, _ in groups):
+        out.append("- If this session runs under Kiro Crew (its runtime is Kiro Crew, including Crew workers), "
+                   "only the Kiro Crew lines below apply to it; ignore the Kiro CLI and Kiro IDE lines.")
+    if rtk_adopted:
+        out.append("- Shell output: follow the existing RTK rule.")
+    else:
+        out.append("- Shell output: run supported commands through `rtk` (for example `rtk git status`, "
+                   "`rtk grep`). Use `rtk proxy <command>` when exact output matters.")
+    for label, cav, pony in groups:
+        prefix = f"{label}: " if label else ""
+        out.append(f"- {prefix}Caveman (reply length) is {CAVEMAN[cav]}")
+        out.append(f"- {prefix}Ponytail (code size) is {PONYTAIL[pony]}")
+    out += [
+        "- At every level, write work reports, CR/PR/commit text, Slack, email, tickets and anything "
+        "sent to another person in full prose. Never shorten code, commands, paths or error text.",
+        "- Ponytail never overrides an explicit user requirement, a security check, validation, or required tests. "
+        "When Ponytail is on, keep its closing line (what was skipped or not checked, and any risk) even when "
+        "Caveman trims the end of a reply.",
+        f"- For details, or to change or turn off a level, load the `{NAME}` skill.",
+    ]
+    return "\n".join(out) + "\n"
+
+
+def block_text(body, path):
+    begin, end = markers(path)
+    return f"{begin}\n{body}{end}\n"
+
+
+def strip_block(text, path):
+    begin, end = markers(path)
+    return re.sub(r"\n?" + re.escape(begin) + r".*?" + re.escape(end) + r"\n?", "", text, flags=re.S)
+
+
+# ---------------------------------------------------------------- desired state
+
+# Edits applied to vendored upstream text when it is installed. The vendored
+# bytes in vendor/ stay identical to the audited pins; the installed copy is a
+# derived file (Apache-2.0 section 4(b)) with a notice on its first line.
+# Each `old` must appear exactly once, so an upstream change fails loudly.
+DERIVE = {
+    "rtk/hooks/rtk-awareness.md": [
+        # The pinned rtk binary (v0.50.0, upstream.lock "binaries") escapes with
+        # `rtk proxy`; `rtk bypass` only exists in later releases.
+        ("`rtk bypass <cmd>`", "`rtk proxy <cmd>`"),
+    ],
+    "caveman/skills/caveman/SKILL.upstream.md": [
+        ("Use for /caveman, \"caveman mode\"", "Use for \"caveman mode\""),
+        ("`/caveman ultra` and `/caveman wenyan` are aliases: follow the `ultracave` or `megacave` skill instead of "
+         "this one. `/caveman status` reports the mode and changes nothing. Relay the hook's `Caveman mode: <mode>` "
+         "value when present. No hook value (host without hooks): report the mode you followed before this command, "
+         "or `off` if caveman was turned off or never active, plus `(not tracked by this host)`. Example: "
+         "`Caveman mode: caveman (not tracked by this host)`. Loading this skill to answer status is not activation. "
+         "Never infer a mode from the configured default.",
+         "The user changes the level in plain words (\"caveman lite\", \"caveman full\", \"caveman ultra\", "
+         "\"stop caveman\"). This install has no hooks, slash commands, aliases or status tracking, and no "
+         "megacave or wenyan mode."),
+        (" `/caveman-compress` exempt.", ""),
+    ],
+    "caveman/skills/ultracave/SKILL.upstream.md": [
+        ("Invoke only with /ultracave or /caveman ultra.", "Use only when the user asks for caveman ultra."),
+        (" `/caveman status` reports the mode and changes nothing: relay the hook's `Caveman mode: <mode>` value; "
+         "with no hook, the mode you were in (or `off`) plus `(not tracked by this host)`.",
+         " This install has no hooks or status tracking."),
+        ("; `/caveman-compress` exempt", ""),
+    ],
+    "ponytail/skills/ponytail-review/SKILL.upstream.md": [
+        ('"is this over-engineered", /ponytail-review.', '"is this over-engineered".'),
+    ],
+    "ponytail/skills/ponytail-audit/SKILL.upstream.md": [
+        ('"what can I delete", /ponytail-audit.', '"what can I delete".'),
+    ],
+    "ponytail/skills/ponytail/SKILL.upstream.md": [
+        ("Switch level: `/ponytail lite|full|ultra`.",
+         "The user switches level in plain words: \"ponytail lite\", \"ponytail full\" or \"ponytail ultra\"."),
+    ],
+}
+
+
+def derive(rel, data, lock):
+    edits = DERIVE.get(rel)
+    if not edits:
+        return data
+    text = data.decode()
+    for old, new in edits:
+        if text.count(old) != 1:
+            sys.exit(f"vendor/{rel}: expected exactly one occurrence of {old[:60]!r}; re-check the patch")
+        text = text.replace(old, new)
+    repo = rel.split("/", 1)[0]
+    pin = lock["repos"][repo]
+    note = (f"<!-- Modified by {NAME} from {pin['repo']} at {pin['sha']}: hook, slash-command and "
+            f"escape-command lines adjusted for this kit. Original: vendor/{rel}. -->\n")
+    return (note + text).encode()
+
+
+def payload_files():
+    """The skill folder installed under the data dir: skill/ plus vendored
+    upstream text under references/upstream/. Name line follows kit.conf."""
+    lock = json.loads((KIT / "upstream.lock").read_text())
+    files = {}
+    for root, sub in ((KIT / "skill", ""), (KIT / "vendor", "references/upstream/")):
+        if not root.is_dir():
+            continue
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                rel = sub + p.relative_to(root).as_posix()
+                if Path(rel).name == "SKILL.md" and rel != "SKILL.md":
+                    sys.exit(f"refusing nested SKILL.md at {rel}: harnesses would load it as a second skill")
+                data = p.read_bytes()
+                if sub:
+                    data = derive(p.relative_to(root).as_posix(), data, lock)
+                files[rel] = data
+    text = files["SKILL.md"].decode()
+    files["SKILL.md"] = re.sub(r"(?m)^name: .*$", f"name: {NAME}", text, count=1).encode()
+    return files
+
+
+# Telemetry switches exported for every shell the harnesses start (AUDIT.md
+# conditions 3, 4 and 7). Harmless when the tool is not installed.
+ENV = {
+    "RTK_TELEMETRY_DISABLED": "1",
+    "DO_NOT_TRACK": "1",
+    "CAVEMAN_TELEMETRY": "0",
+    "HEADROOM_TELEMETRY": "off",
+    "HEADROOM_BEACON": "off",
+    "HEADROOM_OFFLINE": "1",
+    "HEADROOM_UPDATE_CHECK": "off",
+}
+
+
+def env_sh():
+    lines = [f"# Written by {NAME}. Telemetry off for the tools the kit uses."]
+    lines += [f"export {k}={v}" for k, v in ENV.items()]
+    return ("\n".join(lines) + "\n").encode()
+
+
+def shell_rc_files():
+    """Startup files the user's shell reads for non-interactive commands too:
+    ~/.zshenv for zsh, ~/.bashrc for bash. Only shells in use get a block."""
+    h, shell, out = home(), os.environ.get("SHELL", ""), []
+    if shell.endswith("zsh") or (h / ".zshenv").exists():
+        out.append(h / ".zshenv")
+    if shell.endswith("bash") or (h / ".bashrc").exists():
+        out.append(h / ".bashrc")
+    return out
+
+
+def skill_link(name, adapters):
+    """Where this adapter links the skill, or None to skip. Kiro Crew sessions
+    already see ~/.kiro/skills, so kiro-crew skips its own link when kiro-cli
+    or kiro-ide provides that one (otherwise the skill would appear twice)."""
+    if name == "kiro-crew" and {"kiro-cli", "kiro-ide"} & set(adapters):
+        return None
+    return home() / ADAPTERS[name]["skills"] / NAME
+
+
+def kiro_groups(adapters):
+    """Level lines for the steering file shared by Kiro CLI, Kiro IDE and Kiro
+    Crew. On a Kiro Crew host the Crew lines are always written (levels from
+    the kiro-crew adapter, else off), and the other lines are labelled so they
+    cannot apply to a session Kiro Crew runs."""
+    kiro = {n: adapters[n] for n in adapters if ADAPTERS[n]["rule"] == "steering"}
+    crew = kiro.pop("kiro-crew", None)
+    if crew is None and crew_host():
+        crew = dict(zip(("caveman", "ponytail"), ADAPTERS["kiro-crew"]["defaults"]))
+    merged = {}
+    for n in sorted(kiro):
+        merged.setdefault((kiro[n]["caveman"], kiro[n]["ponytail"]), []).append(ADAPTERS[n]["label"])
+    if crew is None:
+        if len(merged) == 1:
+            (cav, pony), = merged
+            return [(None, cav, pony)]
+        return [(" and ".join(labels) + " sessions", cav, pony) for (cav, pony), labels in merged.items()]
+    groups = [(CREW_LABEL, crew["caveman"], crew["ponytail"])]
+    groups += [(" and ".join(labels) + " sessions that Kiro Crew did not start", cav, pony)
+               for (cav, pony), labels in merged.items()]
+    return groups
+
+
+def desired_state(adapters, shell_env=False):
+    """Map absolute path -> spec for everything the kit should own."""
+    h, want = home(), {}
+    if not adapters:
+        return want
+    skill_dir = data_dir() / "skill"
+    want[str(skill_dir)] = {"kind": "tree", "files": payload_files()}
+    env_file = data_dir() / "env.sh"
+    want[str(env_file)] = {"kind": "file", "content": env_sh()}
+    if shell_env:
+        q = shlex.quote(str(env_file))
+        for rc in shell_rc_files():
+            want[str(rc)] = {"kind": "block", "block": block_text(f"[ -r {q} ] && . {q}\n", rc)}
+    for name in sorted(adapters):
+        a, lv = ADAPTERS[name], adapters[name]
+        link = skill_link(name, adapters)
+        if link:
+            want[str(link)] = {"kind": "symlink", "target": str(skill_dir)}
+        if a["rule"] == "claude-rule":
+            body = rule_text([(None, lv["caveman"], lv["ponytail"])], rtk_rule_present(name) is not None)
+            want[str(h / ".claude" / "rules" / f"{NAME}.md")] = {"kind": "file", "content": body.encode()}
+        elif a["rule"] == "codex-block":
+            body = rule_text([(None, lv["caveman"], lv["ponytail"])], rtk_rule_present(name) is not None)
+            agents = codex_dir() / "AGENTS.md"
+            want[str(agents)] = {"kind": "block", "block": block_text(body, agents)}
+    if any(ADAPTERS[n]["rule"] == "steering" for n in adapters):
+        adopted = any(rtk_rule_present(n) for n in adapters if ADAPTERS[n]["rule"] == "steering")
+        body = "---\ninclusion: always\n---\n\n" + rule_text(kiro_groups(adapters), adopted)
+        want[str(h / ".kiro" / "steering" / f"{NAME}.md")] = {"kind": "file", "content": body.encode()}
+    return want
+
+
+# ---------------------------------------------------------------- plan
+
+def read_tree(p):
+    p = Path(p)
+    if not p.is_dir() or p.is_symlink():
+        return None
+    return {f.relative_to(p).as_posix(): f.read_bytes() for f in sorted(p.rglob("*")) if f.is_file()}
+
+
+def plan(manifest, want):
+    """Return (steps, conflicts). A step is a dict with op, path and details."""
+    steps, conflicts, owned = [], [], manifest["owned"]
+    for path, spec in want.items():
+        p, kind = Path(path), spec["kind"]
+        mine = path in owned
+        if kind == "tree":
+            cur = read_tree(p)
+            if cur == spec["files"]:
+                continue
+            if (p.exists() or p.is_symlink()) and not mine:
+                conflicts.append({"path": path, "reason": f"exists and is not owned by {NAME}"})
+                continue
+            steps.append({"op": "tree", "path": path, "files": spec["files"], "old": cur or {}})
+        elif kind == "symlink":
+            if p.is_symlink() and os.readlink(p) == spec["target"]:
+                if not mine:
+                    conflicts.append({"path": path, "reason": f"already links to the kit but is not in the manifest"})
+                continue
+            if (p.exists() or p.is_symlink()) and not mine:
+                conflicts.append({"path": path, "reason": f"exists and is not owned by {NAME}"})
+                continue
+            steps.append({"op": "symlink", "path": path, "target": spec["target"]})
+        elif kind == "file":
+            new = spec["content"]
+            if p.is_file() and not p.is_symlink() and p.read_bytes() == new:
+                if not mine:
+                    conflicts.append({"path": path, "reason": f"already has the kit's content but is not in the manifest"})
+                continue
+            if (p.exists() or p.is_symlink()) and not mine:
+                conflicts.append({"path": path, "reason": f"exists and is not owned by {NAME}"})
+                continue
+            old = p.read_bytes() if p.is_file() else b""
+            steps.append({"op": "file", "path": path, "old": old, "new": new})
+        elif kind == "block":
+            if p.is_symlink() or (p.exists() and not p.is_file()):
+                conflicts.append({"path": path, "reason": f"is not a regular file"})
+                continue
+            cur = p.read_bytes().decode() if p.exists() else ""
+            if mine:
+                suffix = owned[path]["suffix"]
+                base = cur[: -len(suffix)] if suffix and cur.endswith(suffix) else strip_block(cur, path)
+            else:
+                if markers(path)[0] in cur:
+                    conflicts.append({"path": path, "reason": f"has a {NAME} block but is not in the manifest"})
+                    continue
+                base = cur
+            sep = "\n" if base and not base.endswith("\n") else ""
+            suffix = sep + ("\n" if base else "") + spec["block"]
+            new = base + suffix
+            if new == cur:
+                continue
+            steps.append({"op": "block", "path": path, "old": cur.encode(), "new": new.encode(),
+                          "suffix": suffix, "existed": p.exists(), "first": not mine})
+    for path, rec in owned.items():
+        if path in want:
+            continue
+        p = Path(path)
+        if rec["kind"] == "block":
+            cur = p.read_text() if p.exists() else ""
+            suffix = rec["suffix"]
+            new = cur[: -len(suffix)] if suffix and cur.endswith(suffix) else strip_block(cur, path)
+            steps.append({"op": "unblock", "path": path, "old": cur.encode(), "new": new.encode(), "rec": rec})
+        else:
+            steps.append({"op": "remove", "path": path, "kind": rec["kind"]})
+    return steps, conflicts
+
+
+def show(steps):
+    for s in steps:
+        op, path = s["op"], s["path"]
+        if op == "symlink":
+            print(f"+ symlink {path} -> {s['target']}")
+        elif op == "remove":
+            print(f"- remove {s['kind']} {path}")
+        elif op == "tree":
+            old, new = s["old"], s["files"]
+            changed = sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+            print(f"~ tree {path}: {len(changed)} file(s) differ")
+            for k in changed:
+                print(f"    {'+' if k not in old else '-' if k not in new else '~'} {k}")
+        else:
+            a = s["old"].decode(errors="replace").splitlines(keepends=True)
+            b = s["new"].decode(errors="replace").splitlines(keepends=True)
+            sys.stdout.writelines(difflib.unified_diff(a, b, f"a{path}", f"b{path}"))
+            if b and not b[-1].endswith("\n"):
+                print()
+
+
+# ---------------------------------------------------------------- preflight
+
+def preflight(steps):
+    """Before anything is written: every target's nearest existing parent must
+    be writable and must resolve inside HOME (or inside $CODEX_HOME when set).
+    Returns conflict records; an empty list means apply may start."""
+    roots = [home().resolve()]
+    if os.environ.get("CODEX_HOME"):
+        roots.append(codex_dir().resolve())
+    targets = [manifest_path()]
+    for s in steps:
+        targets.append(Path(s["path"]))
+        if s["op"] == "block" and s["first"] and s["existed"]:
+            targets.append(backup_path(s["path"]))
+    problems = []
+    for t in targets:
+        d = t.parent
+        while not d.exists() and d != d.parent:
+            d = d.parent
+        real = d.resolve()
+        if not any(real == r or r in real.parents for r in roots):
+            problems.append({"path": str(t), "reason": f"parent {d} resolves to {real}, outside HOME"})
+        elif not os.access(d, os.W_OK | os.X_OK):
+            problems.append({"path": str(t), "reason": f"{d} is not writable"})
+    return problems
+
+
+# ---------------------------------------------------------------- apply
+
+def ensure_parent(p, manifest):
+    missing = []
+    d = p.parent
+    while not d.exists():
+        missing.append(d)
+        d = d.parent
+    for d in reversed(missing):
+        d.mkdir(mode=0o700)
+        manifest["created_dirs"].append(str(d))
+
+
+def atomic_write(p, data):
+    tmp = p.with_name(f".{p.name}.{NAME}.tmp")
+    tmp.write_bytes(data)
+    if p.exists():
+        shutil.copymode(p, tmp)
+    os.replace(tmp, p)
+
+
+def backup_path(path):
+    return data_dir() / "backups" / (hashlib.sha256(path.encode()).hexdigest()[:16] + ".orig")
+
+
+def save_manifest(manifest):
+    tmp = manifest_path().with_name(".manifest.json.tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, manifest_path())
+
+
+FAIL_AFTER = os.environ.get(NAME.upper().replace("-", "_") + "_TEST_FAIL_AFTER")  # test hook only
+
+
+def apply(steps, manifest):
+    """Apply steps in order. The manifest is saved after every step, so a
+    failure partway leaves a manifest that records everything written, and
+    uninstall can still remove it."""
+    owned = manifest["owned"]
+    # Write the data dir first, so a manifest exists before anything outside it.
+    ensure_parent(manifest_path(), manifest)
+    save_manifest(manifest)
+    warnings = []
+    for i, s in enumerate(steps):
+        if FAIL_AFTER is not None and i == int(FAIL_AFTER):
+            raise OSError(f"test hook: stopping before step {i}")
+        p, op = Path(s["path"]), s["op"]
+        if op == "tree":
+            if p.exists():
+                shutil.rmtree(p)
+            for rel, data in s["files"].items():
+                f = p / rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(data)
+            owned[s["path"]] = {"kind": "tree"}
+        elif op == "symlink":
+            ensure_parent(p, manifest)
+            if p.is_symlink():
+                p.unlink()
+            p.symlink_to(s["target"])
+            owned[s["path"]] = {"kind": "symlink", "target": s["target"]}
+        elif op == "file":
+            ensure_parent(p, manifest)
+            atomic_write(p, s["new"])
+            owned[s["path"]] = {"kind": "file", "sha256": sha(s["new"])}
+        elif op == "block":
+            rec = owned.get(s["path"])
+            if s["first"]:
+                rec = {"kind": "block", "existed": s["existed"], "orig_sha256": sha(s["old"])}
+                if s["existed"]:
+                    b = backup_path(s["path"])
+                    b.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    shutil.copy2(p, b)
+                    rec["backup"] = str(b)
+            ensure_parent(p, manifest)
+            atomic_write(p, s["new"])
+            rec["suffix"] = s["suffix"]
+            owned[s["path"]] = rec
+        elif op == "unblock":
+            rec = s["rec"]
+            if sha(s["new"]) != rec["orig_sha256"]:
+                warnings.append(f"{p}: changed since install; removed the {NAME} block and kept the backup "
+                                f"{rec.get('backup', '(none: file was new)')}")
+                rec = None
+            if not rec and s["new"]:
+                atomic_write(p, s["new"])
+            elif rec and not rec["existed"]:
+                p.unlink()
+            elif rec:
+                atomic_write(p, s["new"])
+                Path(rec["backup"]).unlink()
+            del owned[s["path"]]
+            if not s["new"] and p.exists() and rec is None:
+                p.unlink()
+        elif op == "remove":
+            if s["kind"] == "tree" and p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            elif p.is_symlink() or p.is_file():
+                p.unlink()
+            del owned[s["path"]]
+        save_manifest(manifest)
+    if manifest["adapters"] or warnings:
+        save_manifest(manifest)
+    else:
+        # Last harness removed: delete the kit's own state and the empty
+        # directories it created, deepest first.
+        shutil.rmtree(data_dir() / "backups", ignore_errors=True)
+        if manifest_path().exists():
+            manifest_path().unlink()
+        for d in sorted(manifest["created_dirs"], key=len, reverse=True):
+            try:
+                Path(d).rmdir()
+            except OSError:
+                pass
+    for w in warnings:
+        print("WARNING:", w)
+
+
+# ---------------------------------------------------------------- commands
+
+def harness_list(values):
+    names = []
+    for v in values or []:
+        names += list(ADAPTERS) if v == "all" else [v]
+    if not names:
+        sys.exit("give --harness NAME (repeatable) or --harness all. Names: " + ", ".join(ADAPTERS))
+    return names
+
+
+def cmd_change(args, removing):
+    m = load_manifest()
+    adapters = {k: dict(v) for k, v in m["adapters"].items()}
+    for n in harness_list(args.harness):
+        if removing:
+            adapters.pop(n, None)
+            continue
+        cur = adapters.get(n, {})
+        cav, pony = ADAPTERS[n]["defaults"]
+        adapters[n] = {"caveman": args.caveman or cur.get("caveman", cav),
+                       "ponytail": args.ponytail or cur.get("ponytail", pony)}
+    shell_env = m.get("shell_env", False) if args.shell_env is None else args.shell_env
+    if not adapters:
+        shell_env = False
+    steps, conflicts = plan(m, desired_state(adapters, shell_env))
+    if not conflicts:
+        conflicts = preflight(steps)
+    for c in conflicts:
+        print(f"CONFLICT: {c['path']}: {c['reason']}")
+    if conflicts:
+        print("Nothing written. Move or remove the conflicting paths, then run again.")
+        return 2
+    if not steps and adapters == m["adapters"] and shell_env == m.get("shell_env", False):
+        print("No changes.")
+        return 0
+    show(steps)
+    if not args.apply:
+        print(f"DRY RUN: {len(steps)} change(s), nothing written. Add --apply to write.")
+        return 0
+    m["adapters"], m["shell_env"] = adapters, shell_env
+    try:
+        apply(steps, m)
+    except OSError as e:
+        print(f"ERROR: apply stopped: {e}. The manifest records every change made so far; "
+              "fix the cause and run the same command again, or run uninstall.")
+        return 1
+    print(f"Applied {len(steps)} change(s).")
+    if removing and not adapters:
+        unschedule(apply_=True, quiet=True)
+    if not removing and "cursor" in harness_list(args.harness):
+        print(cursor_note())
+    return 0
+
+
+def cursor_note():
+    return ("Cursor keeps user rules in Settings > Rules, not in a file. To make the levels always-on there, "
+            f"paste:\n{rule_text([('Cursor', 'lite', 'lite')], False)}")
+
+
+def cmd_status(args):
+    m = load_manifest()
+    names = harness_list(args.harness) if args.harness else list(ADAPTERS)
+    want = desired_state(m["adapters"], m.get("shell_env", False))
+    steps, conflicts = plan(m, want)
+    drift = {s["path"] for s in steps} | {c["path"] for c in conflicts}
+    rc = 0
+    for n in names:
+        a = ADAPTERS[n]
+        if n not in m["adapters"]:
+            print(f"{n}: not installed")
+            continue
+        lv = m["adapters"][n]
+        link = skill_link(n, m["adapters"])
+        paths = ([str(link)] if link else []) + [str(data_dir() / "skill")]
+        paths += [p for p in want if (a["rule"] == "steering" and p == str(home() / ".kiro" / "steering" / f"{NAME}.md"))
+                  or (a["rule"] == "claude-rule" and p == str(home() / ".claude" / "rules" / f"{NAME}.md"))
+                  or (a["rule"] == "codex-block" and p == str(codex_dir() / "AGENTS.md"))]
+        bad = [p for p in paths if p in drift]
+        rtk = rtk_rule_present(n) if a["rule"] else None
+        print(f"{n}: installed, caveman={lv['caveman']} ponytail={lv['ponytail']}, "
+              f"{'OK' if not bad else 'DRIFT'}" + (f", RTK rule adopted from {rtk}" if rtk else ""))
+        for p in paths:
+            print(f"    {'DRIFT' if p in drift else 'ok   '} {p}")
+        rc = rc or (1 if bad else 0)
+    return rc
+
+
+def cmd_doctor(args):
+    rc = 0
+    rtk = shutil.which("rtk")
+    if not rtk:
+        print("WARN rtk not on PATH. Install the Apache-2.0 rtk-oss edition; the kit does not install binaries.")
+    else:
+        pin = json.loads((KIT / "upstream.lock").read_text())["binaries"]["rtk"]
+        ver = subprocess.run([rtk, "--version"], capture_output=True, text=True).stdout.strip()
+        got = sha(Path(rtk).resolve().read_bytes())
+        if got in pin["binary_sha256"].values():
+            print(f"ok   rtk at {rtk} is the pinned {pin['tag']} release binary ({pin['license']}).")
+        else:
+            print(f"WARN rtk at {rtk} ({ver}, sha256 {got[:12]}) is not the pinned {pin['tag']} binary. "
+                  "Check its edition: use rtk-oss (Apache-2.0) or a release before the BUSL engine; never rtk-proxy.")
+        if os.environ.get("RTK_TELEMETRY_DISABLED") != "1":
+            print(f"WARN RTK_TELEMETRY_DISABLED is not 1 in this shell; open a new shell after install "
+                  f"or source {data_dir() / 'env.sh'}.")
+    for tool in ("caveman", "headroom", "rtk-proxy"):
+        if shutil.which(tool):
+            print(f"WARN {tool} is on PATH. The kit never uses it; it may send telemetry or proxy traffic.")
+    m = load_manifest()
+    for n in m["adapters"]:
+        link = skill_link(n, m["adapters"]) or skill_link("kiro-cli", m["adapters"])
+        if not (link.is_symlink() and link.resolve().joinpath("SKILL.md").is_file()):
+            print(f"FAIL {n}: {link} does not resolve to the installed skill")
+            rc = 1
+    seen = [n for n in ("claude-code", "codex") if n in m["adapters"]]
+    if "cursor" in m["adapters"] and seen:
+        print(f"note Cursor also reads ~/.claude/skills and ~/.agents/skills, so it sees the skill from {seen} too.")
+    if {"kiro-cli", "kiro-ide"} & set(m["adapters"]) and "kiro-crew" in m["adapters"]:
+        print("note Kiro Crew sessions also see ~/.kiro/skills, so the kiro-crew adapter uses that link "
+              "instead of adding a second one under ~/.kiro/crew/skills.")
+    if crew_host() and "kiro-crew" not in m["adapters"] and {"kiro-cli", "kiro-ide"} & set(m["adapters"]):
+        print("note This host runs Kiro Crew, which reads ~/.kiro/steering too; the steering file keeps "
+              "Caveman and Ponytail off for Kiro Crew sessions.")
+    print("note Headroom is off. bin/headroom-guard starts it only with --enable-unverified, and the kit "
+          "does not check a headroom install against its pin; see skill/references/headroom.md.")
+    print("doctor:", "FAIL" if rc else "OK")
+    return rc
+
+
+# ---------------------------------------------------------------- update
+
+def _git(*a):
+    return subprocess.run(["git", "-C", str(KIT), *a], capture_output=True, text=True)
+
+
+def _upstream():
+    r = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if r.returncode:
+        sys.exit("update: the kit checkout has no upstream branch; check out a branch that tracks the package remote.")
+    return r.stdout.strip()
+
+
+def launchd_plist():
+    return home() / "Library" / "LaunchAgents" / f"com.{NAME}.update.plist"
+
+
+PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.{name}.update</string>
+  <key>ProgramArguments</key><array>
+    <string>{python}</string>
+    <string>{installer}</string>
+    <string>update</string>
+    <string>--apply</string>
+  </array>
+  <key>StartCalendarInterval</key><dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>10</integer>
+    <key>Minute</key><integer>17</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+"""
+
+
+def cron_line(log):
+    return (f"17 10 * * 1 {shlex.quote(sys.executable)} {shlex.quote(str(KIT / 'install'))} "
+            f"update --apply >> {shlex.quote(str(log))} 2>&1")
+
+
+def unschedule(apply_, quiet=False):
+    if sys.platform == "darwin":
+        p = launchd_plist()
+        if p.exists():
+            if not quiet:
+                print(f"- launchctl unload and remove {p}")
+            if apply_:
+                subprocess.run(["launchctl", "unload", "-w", str(p)], capture_output=True)
+                p.unlink()
+        elif not quiet:
+            print("no scheduled update job.")
+        return
+    cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    txt = cron.stdout if cron.returncode == 0 else ""
+    if markers("crontab")[0] not in txt:
+        if not quiet:
+            print("no scheduled update job.")
+        return
+    if not quiet:
+        print(f"- remove the {NAME} block from the crontab")
+    if apply_:
+        subprocess.run(["crontab", "-"], input=strip_block(txt, "crontab"), text=True, check=True)
+
+
+def cmd_schedule(args, m):
+    if args.schedule and not m["adapters"]:
+        sys.exit("nothing installed; install a harness before scheduling updates.")
+    log = data_dir() / "update.log"
+    if not args.schedule:
+        unschedule(apply_=args.apply)
+    elif sys.platform == "darwin":
+        p = launchd_plist()
+        print(f"+ write {p}\n+ launchctl load -w {p}  (Mondays at 10:17 local time, logs to {log})")
+        if args.apply:
+            subprocess.run(["launchctl", "unload", str(p)], capture_output=True)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(p, PLIST.format(name=NAME, python=sys.executable,
+                                         installer=KIT / "install", log=log).encode())
+            r = subprocess.run(["launchctl", "load", "-w", str(p)], capture_output=True, text=True)
+            if r.returncode:
+                sys.exit("launchctl load failed: " + r.stderr.strip())
+    else:
+        if not shutil.which("crontab"):
+            sys.exit("crontab not found; schedule the update another way (e.g. a systemd user timer).")
+        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        txt = strip_block(cron.stdout if cron.returncode == 0 else "", "crontab")
+        beg, end = markers("crontab")
+        print(f"+ add to crontab: {cron_line(log)}")
+        if args.apply:
+            sep = "" if not txt or txt.endswith("\n") else "\n"
+            subprocess.run(["crontab", "-"], input=f"{txt}{sep}{beg}\n{cron_line(log)}\n{end}\n",
+                           text=True, check=True)
+    if not args.apply:
+        print("DRY RUN: nothing written. Add --apply to write.")
+    return 0
+
+
+def cmd_update(args):
+    m = load_manifest()
+    if args.schedule or args.unschedule:
+        if args.schedule and args.unschedule:
+            sys.exit("give --schedule or --unschedule, not both.")
+        return cmd_schedule(args, m)
+    if not m["adapters"]:
+        print("Nothing installed; run ./install install first.")
+        return 2
+    if not (KIT / ".git").exists():
+        sys.exit(f"update: {KIT} is not a git clone; update pulls the kit's own repository.")
+    if _git("status", "--porcelain").stdout.strip():
+        sys.exit("update: the kit clone has local changes; nothing fetched or written.")
+    up = _upstream()
+    f = _git("fetch", "-q", up.split("/", 1)[0])
+    if f.returncode:
+        sys.exit("update: git fetch failed: " + f.stderr.strip())
+    behind = _git("rev-list", "--count", f"HEAD..{up}").stdout.strip()
+    if behind == "0":
+        print(f"Kit already matches {up}; checking the installed copies.")
+    elif not args.apply:
+        print(f"{behind} new commit(s) on {up}. DRY RUN: nothing pulled or written; "
+              "add --apply to pull and re-apply. The diff below is for the current checkout only.")
+    else:
+        mg = _git("merge", "--ff-only", up)
+        if mg.returncode:
+            sys.exit("update: git merge --ff-only failed: " + mg.stderr.strip())
+        print(f"Pulled {behind} commit(s) from {up}.")
+        sys.stdout.flush()
+        # Re-exec the freshly pulled installer so new install logic does the re-apply.
+        argv = [sys.executable, str(KIT / "install"), "install", "--apply"]
+        for n in m["adapters"]:
+            argv += ["--harness", n]
+        os.execv(sys.executable, argv)
+    args2 = argparse.Namespace(harness=list(m["adapters"]) or None, caveman=None, ponytail=None,
+                               shell_env=None, apply=args.apply)
+    return cmd_change(args2, removing=False)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="install", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    up = sub.add_parser("update", help="pull the kit's repo and re-apply every installed harness")
+    up.add_argument("--apply", action="store_true", help="write changes (default is a dry run)")
+    up.add_argument("--schedule", action="store_true",
+                    help="run update --apply Mondays at 10:17 local time (launchd on macOS, cron elsewhere)")
+    up.add_argument("--unschedule", action="store_true", help="remove the weekly update job")
+    for c in ("install", "uninstall", "status", "doctor"):
+        sp = sub.add_parser(c)
+        if c != "doctor":
+            sp.add_argument("--harness", action="append", choices=list(ADAPTERS) + ["all"])
+        if c in ("install", "uninstall"):
+            sp.add_argument("--apply", action="store_true", help="write changes (default is a dry run)")
+        if c in ("install", "uninstall"):
+            sp.set_defaults(shell_env=None)
+        if c == "install":
+            sp.add_argument("--caveman", choices=LEVELS)
+            sp.add_argument("--ponytail", choices=LEVELS)
+            sp.add_argument("--shell-env", dest="shell_env", action="store_true",
+                            help="also source env.sh (telemetry off) from ~/.zshenv and/or ~/.bashrc")
+            sp.add_argument("--no-shell-env", dest="shell_env", action="store_false",
+                            help="remove that line again")
+    args = ap.parse_args()
+    if args.cmd == "install":
+        return cmd_change(args, removing=False)
+    if args.cmd == "uninstall":
+        return cmd_change(args, removing=True)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "update":
+        return cmd_update(args)
+    return cmd_doctor(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,19 @@
+{
+  "rtk": {
+    "note": "Not installed by the kit. The kit checks that the rtk on PATH is one of these exact binaries. v1.2.1 postdates the rtk/rtk-oss edition split: only the rtk-oss assets (Apache-2.0, no engine/ or proxy/ crates) are pinned; never use the rtk or rtk-proxy editions. darwin-arm64-homebrew is the homebrew-core 1.2.1 bottle (formula license Apache-2.0).",
+    "version": "1.2.1",
+    "tag": "v1.2.1",
+    "tag_commit": "d0f0399a5ff8cd1d81325a033f0b2d8864d665f6",
+    "license": "Apache-2.0",
+    "asset": "rtk-oss-x86_64-unknown-linux-musl.tar.gz",
+    "asset_sha256": "44aa460c4827d206d11405c652832c9f7082edccfbc3a9f15a69a851e8a9e8b4",
+    "asset_darwin_arm64": "rtk-oss-aarch64-apple-darwin.tar.gz",
+    "asset_darwin_arm64_sha256": "5a37e5e8e016b559597024900e7b21cff7a0015aa189ac6ac80d461cbb4be65b",
+    "binary_sha256": {
+      "linux-x86_64": "e2950ef652b7e5af115b4573d19ca329a6ee2af758ccaa1de67d5d308694ada0",
+      "darwin-arm64": "10729cf9bbb2d8654a512b9da0cd83c8d282a52f3166da19ea907dc48a8e917e",
+      "darwin-arm64-homebrew": "21738988b151e6c6880a566f740124a8c2a599cfe6108e286c464e73eb52a037"
+    },
+    "escape_command": "rtk proxy <cmd>"
+  }
+}
